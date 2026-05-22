@@ -9,31 +9,33 @@ from telegram.ext import (
 )
 
 TOKEN = "7634616460:AAGPJK4Uck_oLGd9ghGkJxrWoJUUnfbK1Z8"
+MAX_SIZE = 50 * 1024 * 1024
 
 STRINGS = {
     "ru": {
-        "start": "Привет! Отправь мне ссылку на фото или видео.",
-        "choose_lang": "Выбери язык / Choose language:",
-        "send_link": "Отправь мне ссылку.",
+        "choose_lang": "Выбери язык:",
+        "lang_set": "Язык: Русский 🇷🇺\n\nОтправь мне ссылку на фото или видео.",
+        "send_link": "Отправь мне ссылку на фото или видео.",
         "downloading": "⏳ Скачиваю...",
         "choose_quality": "Выбери качество:",
-        "too_large": "❌ Файл больше 50 МБ, не могу отправить.",
-        "error": "❌ Ошибка при скачивании.",
-        "lang_set": "Язык установлен: Русский 🇷🇺",
+        "too_large": "❌ Файл больше 50 МБ — не могу отправить через Telegram.",
+        "error": "❌ Не удалось скачать. Проверь ссылку.",
+        "not_url": "Это не похоже на ссылку. Отправь URL.",
     },
     "en": {
-        "start": "Hi! Send me a link to a photo or video.",
-        "choose_lang": "Choose language / Выбери язык:",
-        "send_link": "Send me a link.",
+        "choose_lang": "Choose language:",
+        "lang_set": "Language: English 🇬🇧\n\nSend me a link to a photo or video.",
+        "send_link": "Send me a link to a photo or video.",
         "downloading": "⏳ Downloading...",
         "choose_quality": "Choose quality:",
-        "too_large": "❌ File is larger than 50 MB, can't send.",
-        "error": "❌ Error downloading.",
-        "lang_set": "Language set: English 🇬🇧",
+        "too_large": "❌ File is larger than 50 MB — can't send via Telegram.",
+        "error": "❌ Failed to download. Check the link.",
+        "not_url": "That doesn't look like a URL. Send a link.",
     },
 }
 
 user_lang: dict[int, str] = {}
+
 
 def t(uid: int, key: str) -> str:
     return STRINGS[user_lang.get(uid, "en")][key]
@@ -61,8 +63,7 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    parts = query.data.split(":", 2)  # quality:<fmt>:<url>
-    fmt, url = parts[1], parts[2]
+    _, fmt, url = query.data.split(":", 2)
     uid = query.from_user.id
     msg = await query.edit_message_text(t(uid, "downloading"))
     await do_download(url, fmt, uid, query.message.chat_id, context, msg)
@@ -70,111 +71,101 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    url = update.message.text.strip()
-    msg = await update.message.reply_text(t(uid, "downloading"))
+    text = update.message.text.strip()
 
+    if not text.startswith(("http://", "https://")):
+        await update.message.reply_text(t(uid, "not_url"))
+        return
+
+    msg = await update.message.reply_text(t(uid, "downloading"))
     loop = asyncio.get_event_loop()
+
     try:
-        info = await loop.run_in_executor(None, lambda: _get_info(url))
+        info = await loop.run_in_executor(None, lambda: _get_info(text))
     except Exception:
         await msg.edit_text(t(uid, "error"))
         return
 
     formats = info.get("formats") or []
-    is_video = info.get("_type") != "photo" and any(
-        f.get("vcodec") not in (None, "none") for f in formats
-    )
+    has_video = any(f.get("vcodec") not in (None, "none") for f in formats)
 
-    # If video with multiple qualities, show keyboard
-    if is_video and formats:
+    if has_video:
         available = _available_qualities(formats)
         if len(available) > 1:
             kb = [
-                [InlineKeyboardButton(q, callback_data=f"quality:{fid}:{url}")]
-                for q, fid in available
+                [InlineKeyboardButton(label, callback_data=f"quality:{fid}:{text}")]
+                for label, fid in available
             ]
-            await msg.edit_text(
-                t(uid, "choose_quality"),
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
+            await msg.edit_text(t(uid, "choose_quality"), reply_markup=InlineKeyboardMarkup(kb))
             return
 
-    await do_download(url, "best", uid, update.effective_chat.id, context, msg)
+    await do_download(text, "best", uid, update.effective_chat.id, context, msg)
 
 
-def _available_qualities(formats):
-    seen = set()
-    result = []
-    labels = [
-        ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
-        ("720p",  "bestvideo[height<=720]+bestaudio/best[height<=720]"),
-        ("480p",  "bestvideo[height<=480]+bestaudio/best[height<=480]"),
-        ("360p",  "bestvideo[height<=360]+bestaudio/best[height<=360]"),
-        ("best",  "best"),
-    ]
-    heights = {int(f["height"]) for f in formats if f.get("height")}
-    for label, fid in labels:
-        if label == "best":
-            result.append(("Best", fid))
-        else:
-            h = int(label[:-1])
-            if any(x <= h for x in heights) and label not in seen:
-                seen.add(label)
-                result.append((label, fid))
-    return result
-
-
-def _get_info(url):
-    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+def _get_info(url: str) -> dict:
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
         return ydl.extract_info(url, download=False)
 
 
-def _download_file(url: str, fmt: str, path: str):
-    ydl_opts = {
+def _download_file(url: str, fmt: str, out_tmpl: str):
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "format": fmt,
-        "outtmpl": path,
+        "outtmpl": out_tmpl,
         "merge_output_format": "mp4",
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
 
-async def do_download(url, fmt, uid, chat_id, context, status_msg):
-    tmp_base = f"/tmp/{uuid.uuid4()}"
-    tmp_path = tmp_base + ".%(ext)s"
+def _available_qualities(formats: list) -> list:
+    heights = {int(f["height"]) for f in formats if f.get("height")}
+    result = []
+    for label, max_h, fid in [
+        ("1080p", 1080, "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
+        ("720p",  720,  "bestvideo[height<=720]+bestaudio/best[height<=720]"),
+        ("480p",  480,  "bestvideo[height<=480]+bestaudio/best[height<=480]"),
+        ("360p",  360,  "bestvideo[height<=360]+bestaudio/best[height<=360]"),
+    ]:
+        if any(h <= max_h for h in heights):
+            result.append((label, fid))
+    if not result:
+        result.append(("Best", "best"))
+    return result
 
+
+async def do_download(url: str, fmt: str, uid: int, chat_id: int, context, status_msg):
+    tmp_id = str(uuid.uuid4())
+    out_tmpl = f"/tmp/{tmp_id}.%(ext)s"
     loop = asyncio.get_event_loop()
+
     try:
-        await loop.run_in_executor(None, lambda: _download_file(url, fmt, tmp_base + ".%(ext)s"))
+        await loop.run_in_executor(None, lambda: _download_file(url, fmt, out_tmpl))
     except Exception:
         await status_msg.edit_text(t(uid, "error"))
         return
 
-    # Find the actual downloaded file
-    actual = None
-    for f in os.listdir("/tmp"):
-        if f.startswith(os.path.basename(tmp_base)):
-            actual = f"/tmp/{f}"
-            break
+    actual = next(
+        (f"/tmp/{f}" for f in os.listdir("/tmp") if f.startswith(tmp_id)),
+        None
+    )
 
-    if not actual or not os.path.exists(actual):
+    if not actual:
         await status_msg.edit_text(t(uid, "error"))
         return
 
-    size = os.path.getsize(actual)
-    if size > 50 * 1024 * 1024:
-        os.remove(actual)
-        await status_msg.edit_text(t(uid, "too_large"))
-        return
-
-    ext = actual.rsplit(".", 1)[-1].lower()
     try:
+        if os.path.getsize(actual) > MAX_SIZE:
+            await status_msg.edit_text(t(uid, "too_large"))
+            return
+
+        ext = actual.rsplit(".", 1)[-1].lower()
         with open(actual, "rb") as fh:
-            if ext in ("jpg", "jpeg", "png", "webp", "gif"):
+            if ext in ("jpg", "jpeg", "png", "webp"):
                 await context.bot.send_photo(chat_id=chat_id, photo=fh)
+            elif ext == "gif":
+                await context.bot.send_animation(chat_id=chat_id, animation=fh)
             else:
                 await context.bot.send_video(chat_id=chat_id, video=fh, supports_streaming=True)
         await status_msg.delete()
