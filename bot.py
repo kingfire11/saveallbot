@@ -1,6 +1,8 @@
 import os
 import uuid
 import asyncio
+import subprocess
+import json
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -78,8 +80,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = await update.message.reply_text(t(uid, "downloading"))
-    loop = asyncio.get_event_loop()
 
+    # Pinterest blocks yt-dlp info requests — skip to download directly
+    is_pinterest = "pinterest.com" in text or "pin.it" in text
+    if is_pinterest:
+        await do_download(text, "best", uid, update.effective_chat.id, context, msg)
+        return
+
+    loop = asyncio.get_event_loop()
     try:
         info = await loop.run_in_executor(None, lambda: _get_info(text))
     except Exception:
@@ -119,6 +127,35 @@ def _download_file(url: str, fmt: str, out_tmpl: str):
         ydl.download([url])
 
 
+def _gallery_dl_download(url: str, out_dir: str) -> str | None:
+    """Download via gallery-dl, return path to downloaded file or None."""
+    result = subprocess.run(
+        ["gallery-dl", "-j", url],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+    # Find direct media URL (list items where index 1 is a string URL)
+    media_url = next(
+        (item[1] for item in data if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], str)),
+        None
+    )
+    if not media_url:
+        return None
+    # Download the actual file
+    ext = media_url.split("?")[0].rsplit(".", 1)[-1].lower() or "jpg"
+    out_path = os.path.join(out_dir, f"{uuid.uuid4()}.{ext}")
+    dl = subprocess.run(
+        ["curl", "-sL", "-o", out_path, media_url],
+        capture_output=True, timeout=60
+    )
+    return out_path if dl.returncode == 0 and os.path.exists(out_path) else None
+
+
 def _available_qualities(formats: list) -> list:
     heights = {int(f["height"]) for f in formats if f.get("height")}
     result = []
@@ -140,16 +177,21 @@ async def do_download(url: str, fmt: str, uid: int, chat_id: int, context, statu
     out_tmpl = f"/tmp/{tmp_id}.%(ext)s"
     loop = asyncio.get_event_loop()
 
+    actual = None
+
+    # Try yt-dlp first
     try:
         await loop.run_in_executor(None, lambda: _download_file(url, fmt, out_tmpl))
+        actual = next(
+            (f"/tmp/{f}" for f in os.listdir("/tmp") if f.startswith(tmp_id)),
+            None
+        )
     except Exception:
-        await status_msg.edit_text(t(uid, "error"))
-        return
+        pass
 
-    actual = next(
-        (f"/tmp/{f}" for f in os.listdir("/tmp") if f.startswith(tmp_id)),
-        None
-    )
+    # Fallback to gallery-dl
+    if not actual:
+        actual = await loop.run_in_executor(None, lambda: _gallery_dl_download(url, "/tmp"))
 
     if not actual:
         await status_msg.edit_text(t(uid, "error"))
